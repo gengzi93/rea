@@ -1,6 +1,7 @@
 import type { JavaScriptJsonDocuments } from "./JavaScriptJsonDocuments.js";
 import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
 import type { ElectronIpcFinding } from "../../domain/javascript/electronStaticAnalysisTypes.js";
+import { ELECTRON_MODULE } from "../../domain/javascript/javascriptElectronMemberWrites.js";
 import type { ElectronBoundarySummary } from "../../domain/javascript/javascriptApplicationAnalysis.js";
 import type { JavaScriptArtifactAnalysis } from "./JavaScriptArtifactAnalysisTypes.js";
 import type { JavaScriptArtifactFile } from "../../domain/javascript/javascriptArtifactFiles.js";
@@ -117,11 +118,101 @@ export const createElectronIpcContext = (
   return { records, owners, states, pairings };
 };
 
+/**
+ * The reference kinds that load a module by package specifier. A `worker` or
+ * `service-worker` reference records a URL relative to the importing source, so
+ * `new Worker(new URL("electron", import.meta.url))` names a local file and is
+ * not an Electron module.
+ */
+const ELECTRON_REFERENCE_KINDS: ReadonlySet<string> = new Set([
+  "static-import",
+  "dynamic-import",
+  "require",
+]);
+
+/**
+ * Whether any analyzed source names an Electron module. The same
+ * `ELECTRON_MODULE` entry points the static analysis admits are used here, so
+ * `electron`, `electron/main` and the other supported subpaths count while an
+ * unrelated `electron-helper` package does not.
+ *
+ * The two fact owners answer different parts of the question. Module links are
+ * the richer fact and answer a runtime `import` or `require` while excluding a
+ * `type-import`, so they are read first. They are absent when semantic analysis
+ * was skipped for a budget, and a rejected application projection drops them.
+ * The retained static reference answers those cases: it records a whole
+ * `import type` declaration as no reference at all, so it is read for the module
+ * loading kinds above. A dynamic specifier is never counted by either owner, so
+ * this establishes an observed reference rather than absence.
+ */
+export const electronModuleReferenced = (
+  analysis: JavaScriptArtifactAnalysis,
+): boolean =>
+  analysis.files.some(({ javascript, semantic }) => {
+    const links = semantic?.ir.moduleLinks;
+    if (
+      links !== undefined &&
+      links.some(
+        ({ specifier, kind }) =>
+          kind !== "type-import" &&
+          specifier !== null &&
+          ELECTRON_MODULE.test(specifier),
+      )
+    )
+      return true;
+    return (javascript?.references ?? []).some(
+      ({ specifier, kind }) =>
+        ELECTRON_REFERENCE_KINDS.has(kind) &&
+        specifier !== null &&
+        ELECTRON_MODULE.test(specifier),
+    );
+  });
+
+/** Every Electron boundary fact family the graph reports. */
+export const electronBoundaryFactCount = (
+  analysis: JavaScriptArtifactAnalysis,
+): number =>
+  analysis.files.reduce(
+    (count, { javascript }) =>
+      count +
+      (javascript === null
+        ? 0
+        : javascript.electron.browser_windows.length +
+          javascript.electron.context_bridge_apis.length +
+          javascript.electron.ipc.length +
+          javascript.electron.sender_validations.length +
+          javascript.electron.utility_processes.length +
+          javascript.electron.native_addon_bindings.length +
+          javascript.electron.protocols.length),
+    0,
+  );
+
+/**
+ * Whether the Electron boundary summary came back empty. `undefined` means no
+ * analyzed source names Electron, which is unknown rather than absent: unread
+ * sources and dynamic module names can hide its use.
+ */
+export const electronSemanticsState = (
+  analysis: JavaScriptArtifactAnalysis,
+): "recovered" | "empty" | undefined =>
+  electronModuleReferenced(analysis) === false
+    ? undefined
+    : electronBoundaryFactCount(analysis) === 0
+      ? "empty"
+      : "recovered";
+
 /** Summarize static Electron findings without treating gaps as absence. */
 export const summarizeElectronBoundaries = (
   analysis: JavaScriptArtifactAnalysis,
   ipcContext: ElectronIpcContext,
   directoryPaths?: ReadonlySet<string>,
+  /**
+   * Analysis view used only to describe coverage. A rejected application
+   * projection replaces a file with a placeholder in `analysis`, which would
+   * hide a retained Electron reference, so the caller passes the raw analysis
+   * and both outputs then share one coverage result.
+   */
+  coverageAnalysis: JavaScriptArtifactAnalysis = analysis,
 ): ElectronBoundarySummary => {
   const files = new Map(analysis.files.map(({ file }) => [file.path, file]));
   const javascript = analysis.files.flatMap(({ javascript: value }) =>
@@ -155,7 +246,15 @@ export const summarizeElectronBoundaries = (
       finding.channel === null ? [] : [finding.channel],
     ),
   );
+  const protocolCount = javascript.reduce(
+    (count, { electron }) => count + electron.protocols.length,
+    0,
+  );
+  // The coverage state is read from the retained analysis so that a rejected
+  // projection cannot hide an Electron reference the graph still reports.
+  const semantics = electronSemanticsState(coverageAnalysis);
   return {
+    ...(semantics === undefined ? {} : { electron_semantics: semantics }),
     browser_windows: windows.length,
     explicit_web_preferences: windows.reduce(
       (count, window) => count + window.web_preferences.length,
@@ -220,10 +319,7 @@ export const summarizeElectronBoundaries = (
         moduleKind: finding.module_kind,
       }),
     ).length,
-    protocol_registrations: javascript.reduce(
-      (count, { electron }) => count + electron.protocols.length,
-      0,
-    ),
+    protocol_registrations: protocolCount,
   };
 };
 
